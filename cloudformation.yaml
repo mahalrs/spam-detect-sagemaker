@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create AWS Resources
+
+Parameters:
+  SageMakerInferenceEndpoint:
+    Type: String
+  
+  SESDomainEntityName:
+    Type: String
+    Description: Verified SES domain entity
+    Default: awscloud.mahal.dev
+  
+  SESBucketName:
+    Type: String
+    Description: Unique name for the S3 bucket to store emails
+    Default: ses-email-detect-columbia-cloud-v1
+
+  SagemakerDataBucketName:
+    Type: String
+    Description: Name of S3 bucket storing training data
+    Default: sagemaker-columbia
+
+  SagemakerDataBucketKeyPrefix:
+    Type: String
+    Description: Key prefix for S3 bucket storing training data
+    Default: sms-spam-classifier
+
+  GitHubRepo:
+    Type: String
+  
+  GitHubBranch:
+    Type: String
+  
+  GitHubToken:
+    Type: String
+
+  GitHubUser:
+    Type: String
+
+Resources:
+  SESEmailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SESBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: s3:ObjectCreated:Put
+          Function: !GetAtt InferenceLambda.Arn
+  
+  SESEmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPut
+            Effect: Allow
+            Principal:
+              Service:
+              - ses.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub arn:aws:s3:::${SESBucketName}/*
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+              StringLike:
+                AWS:SourceArn: arn:aws:ses:*
+      Bucket: !Ref SESEmailBucket
+
+  InferenceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: spam-detect
+      Runtime: python3.9
+      Timeout: 300
+      Role: !GetAtt InferenceLambdaIAMRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          PREDICTION_ENDPOINT: !Ref SageMakerInferenceEndpoint
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          def lambda_handler(event, context):
+            print("Prediction Endpoint", os.environ["PREDICTION_ENDPOINT"])
+            print("Received event: " + json.dumps(event))
+            message = 'Hello World!'
+            return message
+  
+  InferenceLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InferenceLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${SESBucketName}
+
+  InferenceLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InferenceLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: logs:*
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: ses-email-bucket
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: s3:PutBucketNotification
+            Resource:
+            - !Sub arn:aws:s3:::${SESBucketName}
+            - !Sub arn:aws:s3:::${SESBucketName}/*
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+            - !Sub arn:aws:s3:::${SESBucketName}
+            - !Sub arn:aws:s3:::${SESBucketName}/*
+      - PolicyName: send-email
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+            Resource: '*'
+      - PolicyName: prediction-endpoint
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - sagemaker:InvokeEndpoint
+            Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerInferenceEndpoint}
+
+  SESReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+  
+  SESReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    Properties:
+      RuleSetName: !Ref SESReceiptRuleSet
+      Rule:
+        Enabled: true
+        ScanEnabled: true
+        Recipients:
+          - !Ref SESDomainEntityName
+        Actions:
+          - S3Action:
+              BucketName: !Ref SESEmailBucket
+
+  RetrainLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: spam-detect-retrain
+      Runtime: python3.9
+      Timeout: 800
+      MemorySize: 250
+      Role: !GetAtt RetrainLambdaIAMRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          SAGEMAKER_BUCKET: !Ref SagemakerDataBucketName
+          SAGEMAKER_BUCKET_KEY_PREFIX: !Ref SagemakerDataBucketKeyPrefix
+          SAGEMAKER_ROLE: !GetAtt RetrainLambdaIAMRole.Arn
+          PREDICTION_ENDPOINT: !Ref SageMakerInferenceEndpoint
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          def lambda_handler(event, context):
+            print("Prediction Endpoint", os.environ["PREDICTION_ENDPOINT"])
+            print("Received event: " + json.dumps(event))
+            message = 'Hello World!'
+            return message
+
+  RetrainLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RetrainLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+              - sagemaker.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: logs:*
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: sagemaker-bucket
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: s3:*
+            Resource:
+            - !Sub arn:aws:s3:::${SagemakerDataBucketName}
+            - !Sub arn:aws:s3:::${SagemakerDataBucketName}/*
+      - PolicyName: sagemaker
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - sagemaker:*
+            - sagemaker-geospatial:*
+            - sagemaker:DescribeEndpoint
+            Resource:
+            - '*'
+      - PolicyName: passrole
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource:
+            - '*'
+
+  RetrainEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: 'rate(12 hours)'
+      State: ENABLED
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - RetrainLambda
+              - Arn
+          Id: TargetFunctionV1
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt RetrainLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - RetrainEvent
+          - Arn
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - codebuild.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: code-build-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource:
+                  - !Sub arn:aws:s3:::${AssetsBucket}/*
+                  - !GetAtt InferenceLambda.Arn
+                  - !GetAtt RetrainLambda.Arn
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - lambda:*
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:ListObjects
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - codepipeline.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: code-pipeline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::${AssetsBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:ListObjects
+              - Resource:
+                  - arn:aws:s3:::*
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - lambda:*
+
+  LambdaBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "CODEPIPELINE"
+      Source:
+        Type: "CODEPIPELINE"
+        BuildSpec: |
+          version: 0.1
+          phases:
+            install:
+              commands:
+                - echo Installing packages for Inference Lambda
+                - cd ./inference-lambda && pip3.9 install --platform manylinux2014_x86_64 --target ./package --implementation cp --python 3.9 --only-binary=:all: --upgrade numpy
+                - echo Installing packages for Retrain Lambda
+                - cd ./retrain-lambda && pip3.9 install --target ./package sagemaker
+                - cd ./retrain-lambda && pip3.9 install --platform manylinux2014_x86_64 --target ./package --implementation cp --python 3.9 --only-binary=:all: --upgrade numpy
+            build:
+              commands:
+                - echo Building Inference Lambda
+                - cd ./inference-lambda/package && zip -r ../lambda-inference-package.zip .
+                - cd ./inference-lambda && zip lambda-inference-package.zip index.py sms_spam_classifier_utilities.py
+                - echo Building Retrain Lambda
+                - cd ./retrain-lambda/package && zip -r ../lambda-retrain-package.zip .
+                - cd ./retrain-lambda && zip lambda-retrain-package.zip index.py sms_spam_classifier_utilities.py sms_spam_classifier_mxnet_script.py
+          artifacts:
+            files:
+              - 'inference-lambda/lambda-inference-package.zip'
+              - 'retrain-lambda/lambda-retrain-package.zip'
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/amazonlinux2-x86_64-standard:3.0"
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: PUBLIC_URL
+            Value: '/'
+      Name: !Sub ${AWS::StackName}-build-lambda
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  DeployLambdaBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "CODEPIPELINE"
+      Source:
+        Type: "CODEPIPELINE"
+        BuildSpec: |
+          version: 0.1
+          phases:
+            build:
+              commands:
+                - echo Deploying Inference Lambda
+                - cd ./inference-lambda && aws lambda update-function-code --function-name $INFERENCE_LAMBDA --region $AWS_DEFAULT_REGION --zip-file fileb://lambda-inference-package.zip
+                - echo Deploying Retrain Lambda
+                - cd ./retrain-lambda && aws lambda update-function-code --function-name $RETRAIN_LAMBDA --region $AWS_DEFAULT_REGION --zip-file fileb://lambda-retrain-package.zip
+                - echo 'Done deploying..'
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/amazonlinux2-x86_64-standard:3.0"
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: INFERENCE_LAMBDA
+            Value: !Ref InferenceLambda
+          - Name: RETRAIN_LAMBDA
+            Value: !Ref RetrainLambda
+      Name: !Sub ${AWS::StackName}-deploy-lambda
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  LambdaPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref AssetsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: LambdaCode
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GitHubUser
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: LambdaBuildStep
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref LambdaBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: LambdaBuild
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: LambdaDeployStep
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref DeployLambdaBuildProject
+              InputArtifacts:
+                - Name: LambdaBuild
+              RunOrder: 1
